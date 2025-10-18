@@ -8,6 +8,9 @@ module Puma
   # serve requests. This class spawns a new instance of `Puma::Server` via
   # a call to `start_server`.
   class Runner
+
+    include ::Puma::Const::PipeRequest
+
     def initialize(launcher)
       @launcher = launcher
       @log_writer = launcher.log_writer
@@ -27,10 +30,9 @@ module Puma
     def wakeup!
       return unless @wakeup
 
-      @wakeup.write "!" unless @wakeup.closed?
+      @wakeup.write PIPE_WAKEUP unless @wakeup.closed?
 
     rescue SystemCallError, IOError
-      Puma::Util.purge_interrupt_queue
     end
 
     def development?
@@ -68,14 +70,18 @@ module Puma
         token = nil if token.empty? || token == 'none'
       end
 
-      app = Puma::App::Status.new @launcher, token
+      app = Puma::App::Status.new @launcher, token: token, data_only: @options[:control_data_only]
 
-      # A Reactor is not created aand nio4r is not loaded when 'queue_requests: false'
+      # A Reactor is not created and nio4r is not loaded when 'queue_requests: false'
       # Use `nil` for events, no hooks in control server
       control = Puma::Server.new app, nil,
         { min_threads: 0, max_threads: 1, queue_requests: false, log_writer: @log_writer }
 
-      control.binder.parse [str], nil, 'Starting control server'
+      begin
+        control.binder.parse [str], nil, 'Starting control server'
+      rescue Errno::EADDRINUSE, Errno::EACCES => e
+        raise e, "Error: Control server address '#{str}' is already in use. Original error: #{e.message}"
+      end
 
       control.run thread_name: 'ctl'
       @control = control
@@ -86,26 +92,14 @@ module Puma
       @control.binder.close_listeners if @control
     end
 
-    # @!attribute [r] ruby_engine
-    def ruby_engine
-      if !defined?(RUBY_ENGINE) || RUBY_ENGINE == "ruby"
-        "ruby #{RUBY_VERSION}-p#{RUBY_PATCHLEVEL}"
-      else
-        if defined?(RUBY_ENGINE_VERSION)
-          "#{RUBY_ENGINE} #{RUBY_ENGINE_VERSION} - ruby #{RUBY_VERSION}"
-        else
-          "#{RUBY_ENGINE} #{RUBY_VERSION}"
-        end
-      end
-    end
-
     def output_header(mode)
       min_t = @options[:min_threads]
       max_t = @options[:max_threads]
       environment = @options[:environment]
 
       log "Puma starting in #{mode} mode..."
-      log "* Puma version: #{Puma::Const::PUMA_VERSION} (#{ruby_engine}) (\"#{Puma::Const::CODE_NAME}\")"
+      log "* Puma version: #{Puma::Const::PUMA_VERSION} (\"#{Puma::Const::CODE_NAME}\")"
+      log "* Ruby version: #{RUBY_DESCRIPTION}"
       log "*  Min threads: #{min_t}"
       log "*  Max threads: #{max_t}"
       log "*  Environment: #{environment}"
@@ -115,6 +109,14 @@ module Puma
       else
         log "*          PID: #{Process.pid}"
       end
+    end
+
+    def warn_ruby_mn_threads
+      return if !ENV.key?('RUBY_MN_THREADS')
+
+      log "! WARNING: Detected `RUBY_MN_THREADS=#{ENV['RUBY_MN_THREADS']}`"
+      log "! This setting is known to cause performance regressions with Puma."
+      log "! Consider disabling this environment variable: https://github.com/puma/puma/issues/3720"
     end
 
     def redirected_io?
@@ -182,6 +184,10 @@ module Puma
       end
     end
 
+    def utc_iso8601(val)
+      "#{val.utc.strftime '%FT%T'}Z"
+    end
+
     def stats
       {
         versions: {
@@ -193,6 +199,13 @@ module Puma
           }
         }
       }
+    end
+
+    # this method call should always be guarded by `@log_writer.debug?`
+    def debug_loaded_extensions(str)
+      @log_writer.debug "────────────────────────────────── #{str}"
+      re_ext = /\.#{RbConfig::CONFIG['DLEXT']}\z/i
+      $LOADED_FEATURES.grep(re_ext).each { |f| @log_writer.debug("    #{f}") }
     end
   end
 end

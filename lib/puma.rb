@@ -3,8 +3,6 @@
 # Standard libraries
 require 'socket'
 require 'tempfile'
-require 'time'
-require 'etc'
 require 'uri'
 require 'stringio'
 
@@ -28,7 +26,7 @@ module Puma
   # not in minissl.rb
   HAS_SSL = const_defined?(:MiniSSL, false) && MiniSSL.const_defined?(:Engine, false)
 
-  HAS_UNIX_SOCKET = Object.const_defined? :UNIXSocket
+  HAS_UNIX_SOCKET = Object.const_defined?(:UNIXSocket) && !IS_WINDOWS
 
   if HAS_SSL
     require_relative 'puma/minissl'
@@ -76,5 +74,15 @@ module Puma
 
   def self.set_thread_name(name)
     Thread.current.name = "puma #{name}"
+  end
+
+  # Shows deprecated warning for renamed methods.
+  # @example
+  #   Puma.deprecate_method_change :on_booted, __callee__, __method__
+  #
+  def self.deprecate_method_change(method_old, method_caller, method_new)
+    if method_old == method_caller
+      warn "Use '#{method_new}', '#{method_caller}' is deprecated and will be removed in v8"
+    end
   end
 end

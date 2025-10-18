@@ -1,6 +1,8 @@
+# frozen_string_literal: true
+
 require_relative "helper"
 
-class TestOutOfBandServer < Minitest::Test
+class TestOutOfBandServer < PumaTest
   parallelize_me!
 
   def setup
@@ -28,7 +30,6 @@ class TestOutOfBandServer < Minitest::Test
   def new_connection
     TCPSocket.new('127.0.0.1', @port).tap {|s| @ios << s}
   rescue IOError
-    Puma::Util.purge_interrupt_queue
     retry
   end
 
@@ -46,15 +47,17 @@ class TestOutOfBandServer < Minitest::Test
     in_oob = Mutex.new
     @mutex = Mutex.new
     oob_wait = options.delete(:oob_wait)
-    oob = -> do
-      in_oob.synchronize do
-        @mutex.synchronize do
-          @oob_count += 1
-          @oob_finished.signal
-          @oob_finished.wait(@mutex, 1) if oob_wait
+    oob = {
+      block: -> do
+        in_oob.synchronize do
+          @mutex.synchronize do
+            @oob_count += 1
+            @oob_finished.signal
+            @oob_finished.wait(@mutex, 1) if oob_wait
+          end
         end
       end
-    end
+    }
     app_wait = options.delete(:app_wait)
     app = ->(_) do
       raise 'OOB conflict' if in_oob.locked?

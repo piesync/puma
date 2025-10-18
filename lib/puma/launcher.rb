@@ -22,12 +22,15 @@ module Puma
     #
     # +conf+ A Puma::Configuration object indicating how to run the server.
     #
-    # +launcher_args+ A Hash that currently has one required key `:events`,
-    # this is expected to hold an object similar to an `Puma::LogWriter.stdio`,
-    # this object will be responsible for broadcasting Puma's internal state
-    # to a logging destination. An optional key `:argv` can be supplied,
-    # this should be an array of strings, these arguments are re-used when
-    # restarting the puma server.
+    # +launcher_args+ A Hash that has a few optional keys.
+    # - +:log_writer+:: Expected to hold an object similar to `Puma::LogWriter.stdio`.
+    #   This object will be responsible for broadcasting Puma's internal state
+    #   to a logging destination.
+    # - +:events+:: Expected to hold an object similar to `Puma::Events`.
+    # - +:argv+:: Expected to be an array of strings.
+    # - +:env+:: Expected to hold a hash of environment variables.
+    #
+    # These arguments are re-used when restarting the puma server.
     #
     # Examples:
     #
@@ -39,55 +42,66 @@ module Puma
     #   end
     #   Puma::Launcher.new(conf, log_writer: Puma::LogWriter.stdio).run
     def initialize(conf, launcher_args={})
-      @runner        = nil
-      @log_writer    = launcher_args[:log_writer] || LogWriter::DEFAULT
-      @events        = launcher_args[:events] || Events.new
-      @argv          = launcher_args[:argv] || []
-      @original_argv = @argv.dup
-      @config        = conf
+      ## Minimal initialization for a potential early restart (e.g. when pruning bundle)
 
-      @config.options[:log_writer] = @log_writer
+      @config = conf
+      @config.clamp
+
+      @options = @config.options
+
+      @log_writer = launcher_args[:log_writer] || LogWriter::DEFAULT
+      @log_writer.formatter = LogWriter::PidFormatter.new if clustered?
+      @log_writer.formatter = @options[:log_formatter] if @options[:log_formatter]
+      @log_writer.custom_logger = @options[:custom_logger] if @options[:custom_logger]
+      @options[:log_writer] = @log_writer
+      @options[:logger] = @log_writer if clustered?
+
+      @events = launcher_args[:events] || Events.new
+
+      @argv = launcher_args[:argv] || []
+      @original_argv = @argv.dup
+
+      ## End minimal initialization
+
+      generate_restart_data
+      Dir.chdir(@restart_dir)
+
+      prune_bundler!
+
+      env = launcher_args.delete(:env) || ENV
 
       # Advertise the Configuration
       Puma.cli_config = @config if defined?(Puma.cli_config)
+      log_config if env['PUMA_LOG_CONFIG']
 
-      @config.load
+      @binder = Binder.new(@log_writer, @options)
+      @binder.create_inherited_fds(env).each { |k| env.delete k }
+      @binder.create_activated_fds(env).each { |k| env.delete k }
 
-      @binder        = Binder.new(@log_writer, conf)
-      @binder.create_inherited_fds(ENV).each { |k| ENV.delete k }
-      @binder.create_activated_fds(ENV).each { |k| ENV.delete k }
+      @environment = @config.environment
 
-      @environment = conf.environment
-
-      if @config.options[:bind_to_activated_sockets]
-        @config.options[:binds] = @binder.synthesize_binds_from_activated_fs(
-          @config.options[:binds],
-          @config.options[:bind_to_activated_sockets] == 'only'
-        )
+      # Load the systemd integration if we detect systemd's NOTIFY_SOCKET.
+      # Skip this on JRuby though, because it is incompatible with the systemd
+      # integration due to https://github.com/jruby/jruby/issues/6504
+      if ENV["NOTIFY_SOCKET"] && !Puma.jruby? && !ENV["PUMA_SKIP_SYSTEMD"]
+        @config.plugins.create('systemd')
       end
 
-      @options = @config.options
-      @config.clamp
-
-      @log_writer.formatter = LogWriter::PidFormatter.new if clustered?
-      @log_writer.formatter = options[:log_formatter] if @options[:log_formatter]
-
-      generate_restart_data
+      if @options[:bind_to_activated_sockets]
+        @options[:binds] = @binder.synthesize_binds_from_activated_fs(
+          @options[:binds],
+          @options[:bind_to_activated_sockets] == 'only'
+        )
+      end
 
       if clustered? && !Puma.forkable?
         unsupported "worker mode not supported on #{RUBY_ENGINE} on this platform"
       end
 
-      Dir.chdir(@restart_dir)
-
-      prune_bundler!
-
       @environment = @options[:environment] if @options[:environment]
       set_rack_environment
 
       if clustered?
-        @options[:logger] = @log_writer
-
         @runner = Cluster.new(self)
       else
         @runner = Single.new(self)
@@ -95,8 +109,6 @@ module Puma
       Puma.stats_object = @runner
 
       @status = :run
-
-      log_config if ENV['PUMA_LOG_CONFIG']
     end
 
     attr_reader :binder, :log_writer, :events, :config, :options, :restart_dir
@@ -129,7 +141,10 @@ module Puma
     # Delete the configured pidfile
     def delete_pidfile
       path = @options[:pidfile]
-      File.unlink(path) if path && File.exist?(path)
+      begin
+        File.unlink(path) if path
+      rescue Errno::ENOENT
+      end
     end
 
     # Begin async shutdown of the server
@@ -156,6 +171,13 @@ module Puma
         log "* phased-restart called but not available, restarting normally."
         return restart
       end
+
+      if @options.file_options[:tag].nil?
+        dir = File.realdirpath(@restart_dir)
+        @options[:tag] = File.basename(dir)
+        set_process_title
+      end
+
       true
     end
 
@@ -180,7 +202,6 @@ module Puma
 
       setup_signals
       set_process_title
-      integrate_with_systemd
 
       # This blocks until the server is stopped
       @runner.run
@@ -260,7 +281,7 @@ module Puma
     end
 
     def do_graceful_stop
-      @events.fire_on_stopped!
+      @events.fire_after_stopped!
       @runner.stop_blocked
     end
 
@@ -272,14 +293,16 @@ module Puma
     end
 
     def restart!
-      @events.fire_on_restart!
-      @config.run_hooks :on_restart, self, @log_writer
+      @events.fire_before_restart!
+      @config.run_hooks :before_restart, self, @log_writer
 
       if Puma.jruby?
         close_binder_listeners
 
         require_relative 'jruby_restart'
-        JRubyRestart.chdir_exec(@restart_dir, restart_args)
+        argv = restart_args
+        JRubyRestart.chdir(@restart_dir)
+        Kernel.exec(*argv)
       elsif Puma.windows?
         close_binder_listeners
 
@@ -309,27 +332,6 @@ module Puma
 
     def reload_worker_directory
       @runner.reload_worker_directory if @runner.respond_to?(:reload_worker_directory)
-    end
-
-    # Puma's systemd integration allows Puma to inform systemd:
-    #  1. when it has successfully started
-    #  2. when it is starting shutdown
-    #  3. periodically for a liveness check with a watchdog thread
-    def integrate_with_systemd
-      return unless ENV["NOTIFY_SOCKET"]
-
-      begin
-        require_relative 'systemd'
-      rescue LoadError
-        log "Systemd integration failed. It looks like you're trying to use systemd notify but don't have sd_notify gem installed"
-        return
-      end
-
-      log "* Enabling systemd notification integration"
-
-      systemd = Systemd.new(@log_writer, @events)
-      systemd.hook_events
-      systemd.start_watchdog
     end
 
     def log(str)
@@ -384,9 +386,9 @@ module Puma
         # using it.
         @restart_dir = Dir.pwd
 
-        # Use the same trick as unicorn, namely favor PWD because
-        # it will contain an unresolved symlink, useful for when
-        # the pwd is /data/releases/current.
+      # Use the same trick as unicorn, namely favor PWD because
+      # it will contain an unresolved symlink, useful for when
+      # the pwd is /data/releases/current.
       elsif dir = ENV['PWD']
         s_env = File.stat(dir)
         s_pwd = File.stat(Dir.pwd)
@@ -421,12 +423,14 @@ module Puma
     end
 
     def setup_signals
-      begin
-        Signal.trap "SIGUSR2" do
-          restart
+      unless ENV["PUMA_SKIP_SIGUSR2"]
+        begin
+          Signal.trap "SIGUSR2" do
+            restart
+          end
+        rescue Exception
+          log "*** SIGUSR2 not implemented, signal based restart unavailable!"
         end
-      rescue Exception
-        log "*** SIGUSR2 not implemented, signal based restart unavailable!"
       end
 
       unless Puma.jruby?

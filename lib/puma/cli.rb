@@ -24,7 +24,7 @@ module Puma
     # Create a new CLI object using +argv+ as the command line
     # arguments.
     #
-    def initialize(argv, log_writer = LogWriter.stdio, events = Events.new)
+    def initialize(argv, log_writer = LogWriter.stdio, events = Events.new, env: ENV)
       @debug = false
       @argv = argv.dup
       @log_writer = log_writer
@@ -39,10 +39,8 @@ module Puma
       @control_url = nil
       @control_options = {}
 
-      setup_options
-
       begin
-        @parser.parse! @argv
+        setup_options env
 
         if file = @argv.shift
           @conf.configure do |user_config, file_config|
@@ -63,7 +61,7 @@ module Puma
         end
       end
 
-      @launcher = Puma::Launcher.new(@conf, :log_writer => @log_writer, :events => @events, :argv => argv)
+      @launcher = Puma::Launcher.new(@conf, env: ENV, log_writer: @log_writer, events: @events, argv: argv)
     end
 
     attr_reader :launcher
@@ -92,8 +90,8 @@ module Puma
     # Build the OptionParser object to handle the available options.
     #
 
-    def setup_options
-      @conf = Configuration.new do |user_config, file_config|
+    def setup_options(env = ENV)
+      @conf = Configuration.new({}, { events: @events }, env) do |user_config, file_config|
         @parser = OptionParser.new do |o|
           o.on "-b", "--bind URI", "URI to bind to (tcp://, unix://, ssl://)" do |arg|
             user_config.bind arg
@@ -144,6 +142,10 @@ module Puma
             $LOAD_PATH.unshift(*arg.split(':'))
           end
 
+          o.on "--idle-timeout SECONDS", "Number of seconds until the next request before automatic shutdown" do |arg|
+            user_config.idle_timeout arg
+          end
+
           o.on "-p", "--port PORT", "Define the TCP port to bind to",
             "Use -b for more advanced options" do |arg|
             user_config.bind "tcp://#{Configuration::DEFAULTS[:tcp_host]}:#{arg}"
@@ -151,6 +153,10 @@ module Puma
 
           o.on "--pidfile PATH", "Use PATH as a pidfile" do |arg|
             user_config.pidfile arg
+          end
+
+          o.on "--plugin PLUGIN", "Load the given PLUGIN. Can be used multiple times to load multiple plugins." do |arg|
+            user_config.plugin arg
           end
 
           o.on "--preload", "Preload the app. Cluster mode only" do
@@ -232,7 +238,7 @@ module Puma
             $stdout.puts o
             exit 0
           end
-        end
+        end.parse! @argv
       end
     end
   end

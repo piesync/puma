@@ -1,10 +1,8 @@
 # frozen_string_literal: true
 
 require 'optparse'
-require_relative 'state_file'
 require_relative 'const'
 require_relative 'detect'
-require_relative 'configuration'
 require 'uri'
 require 'socket'
 
@@ -39,7 +37,7 @@ module Puma
     # @version 5.0.0
     PRINTABLE_COMMANDS = %w[gc-stats stats thread-backtraces].freeze
 
-    def initialize(argv, stdout=STDOUT, stderr=STDERR)
+    def initialize(argv, stdout=STDOUT, stderr=STDERR, env: ENV)
       @state = nil
       @quiet = false
       @pidfile = nil
@@ -48,7 +46,7 @@ module Puma
       @control_auth_token = nil
       @config_file = nil
       @command = nil
-      @environment = ENV['APP_ENV'] || ENV['RACK_ENV'] || ENV['RAILS_ENV']
+      @environment = env['APP_ENV'] || env['RACK_ENV'] || env['RAILS_ENV']
 
       @argv = argv.dup
       @stdout = stdout
@@ -62,7 +60,7 @@ module Puma
           @state = arg
         end
 
-        o.on "-Q", "--quiet", "Not display messages" do |arg|
+        o.on "-Q", "--quiet", "Do not display messages" do |arg|
           @quiet = true
         end
 
@@ -126,8 +124,15 @@ module Puma
         end
 
         if @config_file
-          config = Puma::Configuration.new({ config_files: [@config_file] }, {})
-          config.load
+          # needed because neither `Puma::CLI` or `Puma::Server` are loaded
+          require_relative '../puma'
+
+          require_relative 'configuration'
+          require_relative 'log_writer'
+
+          config = Puma::Configuration.new({ config_files: [@config_file] }, {} , env)
+          config.clamp
+
           @state              ||= config.options[:state]
           @control_url        ||= config.options[:control_url]
           @control_auth_token ||= config.options[:control_auth_token]
@@ -149,6 +154,8 @@ module Puma
           raise "State file not found: #{@state}"
         end
 
+        require_relative 'state_file'
+
         sf = Puma::StateFile.new
         sf.load @state
 
@@ -164,22 +171,26 @@ module Puma
     def send_request
       uri = URI.parse @control_url
 
+      host = uri.host
+
       # create server object by scheme
       server =
         case uri.scheme
         when 'ssl'
           require 'openssl'
+          host = host[1..-2] if host&.start_with? '['
           OpenSSL::SSL::SSLSocket.new(
-            TCPSocket.new(uri.host, uri.port),
+            TCPSocket.new(host, uri.port),
             OpenSSL::SSL::SSLContext.new)
             .tap { |ssl| ssl.sync_close = true }  # default is false
             .tap(&:connect)
         when 'tcp'
-          TCPSocket.new uri.host, uri.port
+          host = host[1..-2] if host&.start_with? '['
+          TCPSocket.new host, uri.port
         when 'unix'
           # check for abstract UNIXSocket
           UNIXSocket.new(@control_url.start_with?('unix://@') ?
-            "\0#{uri.host}#{uri.path}" : "#{uri.host}#{uri.path}")
+            "\0#{host}#{uri.path}" : "#{host}#{uri.path}")
         else
           raise "Invalid scheme: #{uri.scheme}"
         end
@@ -241,7 +252,7 @@ module Puma
           @stdout.flush unless @stdout.sync
           return
         elsif sig.start_with? 'SIG'
-          if Signal.list.key? sig.sub(/\ASIG/, '')
+          if Signal.list.key? sig.delete_prefix('SIG')
             Process.kill sig, @pid
           else
             raise "Signal '#{sig}' not available'"

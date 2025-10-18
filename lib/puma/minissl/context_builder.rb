@@ -38,6 +38,7 @@ module Puma
 
           ctx.key = params['key'] if params['key']
           ctx.key_pem = params['key_pem'] if params['key_pem']
+          ctx.key_password_command = params['key_password_command'] if params['key_password_command']
 
           if params['cert'].nil? && params['cert_pem'].nil?
             log_writer.error "Please specify the SSL cert via 'cert=' or 'cert_pem='"
@@ -50,10 +51,13 @@ module Puma
             unless params['ca']
               log_writer.error "Please specify the SSL ca via 'ca='"
             end
+            # needed for Puma::MiniSSL::Socket#peercert, env['puma.peercert']
+            require 'openssl'
           end
 
           ctx.ca = params['ca'] if params['ca']
           ctx.ssl_cipher_filter = params['ssl_cipher_filter'] if params['ssl_cipher_filter']
+          ctx.ssl_ciphersuites = params['ssl_ciphersuites'] if params['ssl_ciphersuites'] && HAS_TLS1_3
 
           ctx.reuse = params['reuse'] if params['reuse']
         end

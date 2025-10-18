@@ -2,17 +2,26 @@
 require_relative "helper"
 require "net/http"
 
-require "rack"
-require "rack/body_proxy"
-require "rack/chunked" if Rack::RELEASE >= '3'
+# don't load Rack, as it autoloads everything
+begin
+  require "rack/body_proxy"
+  require "rack/lint"
+  require "rack/version"
+  require "rack/common_logger"
+rescue LoadError # Rack 1.6
+  require "rack"
+end
+
+# Rack::Chunked is loaded by Rack v2, needs to be required by Rack 3.0,
+# and is removed in Rack 3.1
+require "rack/chunked" if Rack.release.start_with? '3.0'
 
 require "nio"
-require "open3"
 
-class TestRackServer < Minitest::Test
+class TestRackServer < PumaTest
   parallelize_me!
 
-  TRANSFER_ENCODING_CHUNKED = 'transfer-encoding: chunked'
+  HOST = '127.0.0.1'
 
   STR_1KB = "──#{SecureRandom.hex 507}─\n".freeze
 
@@ -36,7 +45,7 @@ class TestRackServer < Minitest::Test
 
   class ServerLint < Rack::Lint
     def call(env)
-      if Rack::RELEASE < '3'
+      if Rack.release < '3'
         check_env env
       else
         Wrapper.new(@app, env).check_environment env
@@ -48,9 +57,9 @@ class TestRackServer < Minitest::Test
 
   def setup
     @simple = lambda { |env| [200, { "x-header" => "Works" }, ["Hello"]] }
-    @server = Puma::Server.new @simple
-    @port = (@server.add_tcp_listener "127.0.0.1", 0).addr[1]
-    @tcp = "http://127.0.0.1:#{@port}"
+    @server = Puma::Server.new @simple, nil, log_writer: Puma::LogWriter.null
+    @port = (@server.add_tcp_listener HOST, 0).addr[1]
+    @tcp = "http://#{HOST}:#{@port}"
     @stopped = false
   end
 
@@ -127,6 +136,24 @@ class TestRackServer < Minitest::Test
     assert_equal true, closed
   end
 
+  def test_after_reply_error_handling
+    called = []
+    @server.app = lambda do |env|
+      env['rack.after_reply'] << lambda { called << :before }
+      env['rack.after_reply'] << lambda { raise ArgumentError, "oops" }
+      env['rack.after_reply'] << lambda { called << :after }
+      @simple.call(env)
+    end
+
+    @server.run
+
+    hit(["#{@tcp}/test"])
+
+    stop
+
+    assert_equal [:before, :after], called
+  end
+
   def test_after_reply_exception
     @server.app = lambda do |env|
       env['rack.after_reply'] << lambda { raise ArgumentError, "oops" }
@@ -135,14 +162,14 @@ class TestRackServer < Minitest::Test
 
     @server.run
 
-    socket = TCPSocket.open "127.0.0.1", @port
+    socket = TCPSocket.open HOST, @port
     socket.puts "GET /test HTTP/1.1\r\n"
     socket.puts "Connection: Keep-Alive\r\n"
     socket.puts "\r\n"
 
     headers = header_hash socket
 
-    content_length = headers["Content-Length"].to_i
+    content_length = headers["content-length"].to_i
     real_response_body = socket.read(content_length)
 
     assert_equal "Hello", real_response_body
@@ -167,6 +194,58 @@ class TestRackServer < Minitest::Test
     socket.close
 
     stop
+  end
+
+  def test_rack_response_finished
+    calls = []
+
+    @server.app = lambda do |env|
+      env['rack.response_finished'] << lambda { |c_env, status, headers, error|
+        calls << 1
+        assert_same env, c_env
+        assert_equal 200, status
+        assert_instance_of Hash, headers
+        assert_nil error
+      }
+      env['rack.response_finished'] << lambda { |env, status, headers, error| calls << 2; raise "Oops" }
+      env['rack.response_finished'] << lambda { |env, status, headers, error| calls << 3 }
+      @simple.call(env)
+    end
+
+
+    @server.run
+
+    hit(["#{@tcp}/test"])
+
+    stop
+
+    assert_equal [3, 2, 1], calls
+  end
+
+  def test_rack_response_finished_on_error
+    calls = []
+
+    @server.app = lambda do |env|
+      env['rack.response_finished'] << lambda { |c_env, status, headers, error|
+        begin
+          assert_same env, c_env
+          assert_equal 500, status
+          assert_instance_of Hash, headers
+          assert_instance_of RuntimeError, error
+          assert_equal "test_rack_response_finished_on_error", error.message
+          calls << 1
+        end
+      }
+      raise "test_rack_response_finished_on_error"
+    end
+
+    @server.run
+
+    hit(["#{@tcp}/test"])
+
+    stop
+
+    assert_equal [1], calls
   end
 
   def test_rack_body_proxy
@@ -194,20 +273,22 @@ class TestRackServer < Minitest::Test
 
     @server.run
 
-    socket = TCPSocket.open "127.0.0.1", @port
+    socket = TCPSocket.open HOST, @port
     socket.puts "GET /test HTTP/1.1\r\n"
     socket.puts "Connection: Keep-Alive\r\n"
     socket.puts "\r\n"
 
     headers = header_hash socket
 
-    content_length = headers["Content-Length"].to_i
-
     socket.close
 
     stop
 
-    assert_equal str_ary_bytes, content_length
+    if Rack.release.start_with? '1.'
+      assert_equal "chunked", headers["transfer-encoding"]
+    else
+      assert_equal str_ary_bytes, headers["content-length"].to_i
+    end
   end
 
   def test_common_logger
@@ -233,10 +314,10 @@ class TestRackServer < Minitest::Test
     @server.app = rack_app
     @server.run
 
-    resp_body, headers, _status = Open3.capture3 "curl -v #{@tcp}/"
-    assert_includes headers.downcase, TRANSFER_ENCODING_CHUNKED
-    assert_equal STR_1KB, resp_body
-  end if Rack::RELEASE < '3.1'
+    resp = Net::HTTP.get_response URI(@tcp)
+    assert_equal 'chunked', resp['transfer-encoding']
+    assert_equal STR_1KB, resp.body.force_encoding(Encoding::UTF_8)
+  end if Rack.release < '3.1'
 
   def test_rack_chunked_array10
     body = Array.new 10, STR_1KB
@@ -245,19 +326,40 @@ class TestRackServer < Minitest::Test
     @server.app = rack_app
     @server.run
 
-    resp_body, headers, _status = Open3.capture3 "curl -v #{@tcp}/"
-    assert_includes headers.downcase, TRANSFER_ENCODING_CHUNKED
-    assert_equal STR_1KB * 10, resp_body
-  end if Rack::RELEASE < '3.1'
+    resp = Net::HTTP.get_response URI(@tcp)
+    assert_equal 'chunked', resp['transfer-encoding']
+    assert_equal STR_1KB * 10, resp.body.force_encoding(Encoding::UTF_8)
+  end if Rack.release < '3.1'
 
   def test_puma_enum
     body = Array.new(10, STR_1KB).to_enum
     @server.app = lambda { |env| [200, { 'content-type' => 'text/plain; charset=utf-8' }, body] }
     @server.run
 
-    resp_body, headers, _status = Open3.capture3 "curl -v #{@tcp}/"
-    assert_includes headers.downcase, TRANSFER_ENCODING_CHUNKED
-    assert_equal STR_1KB * 10, resp_body
+    resp = Net::HTTP.get_response URI(@tcp)
+    assert_equal 'chunked', resp['transfer-encoding']
+    assert_equal STR_1KB * 10, resp.body.force_encoding(Encoding::UTF_8)
   end
 
+  def test_version_header
+    @server.app = lambda do |env|
+      body = env['HTTP_VERSION']
+      [200, {}, [body]]
+    end
+    @server.run
+
+    socket = TCPSocket.open HOST, @port
+    socket.syswrite "GET / HTTP/1.1\r\nversion: version\r\n\r\n"
+
+    body = socket.sysread(256).split("\r\n\r\n").last
+
+    if Object.const_defined?(:Rack) && ::Rack.respond_to?(:release) &&
+      Gem::Version.new(Rack.release) < Gem::Version.new('3.1.0')
+      assert_equal "HTTP/1.1", body
+    else
+      assert_equal "version", body
+    end
+  ensure
+    socket&.close
+  end
 end

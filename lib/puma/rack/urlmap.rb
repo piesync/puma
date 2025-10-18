@@ -34,7 +34,7 @@ module Puma::Rack
         end
 
         location = location.chomp('/')
-        match = Regexp.new("^#{Regexp.quote(location).gsub('/', '/+')}(.*)", nil, 'n')
+        match = Regexp.new("^#{Regexp.quote(location).gsub('/', '/+')}(.*)", Regexp::NOENCODING)
 
         [host, location, match, app]
       }.sort_by do |(host, location, _, _)|
@@ -70,7 +70,7 @@ module Puma::Rack
         return app.call(env)
       end
 
-      [404, {'Content-Type' => "text/plain", "X-Cascade" => "pass"}, ["Not Found: #{path}"]]
+      [404, {'content-type' => "text/plain", "x-cascade" => "pass"}, ["Not Found: #{path}"]]
 
     ensure
       env['PATH_INFO'] = path

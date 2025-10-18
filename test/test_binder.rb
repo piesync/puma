@@ -8,13 +8,15 @@ require "puma/binder"
 require "puma/events"
 require "puma/configuration"
 
-class TestBinderBase < Minitest::Test
+class TestBinderBase < PumaTest
   include SSLHelper if ::Puma::HAS_SSL
   include TmpPath
 
   def setup
     @log_writer = Puma::LogWriter.strings
-    @binder = Puma::Binder.new(@log_writer)
+    @config = Puma::Configuration.new
+    @config.clamp
+    @binder = Puma::Binder.new(@log_writer, @config.options)
   end
 
   def teardown
@@ -77,6 +79,20 @@ class TestBinderParallel < TestBinderBase
 
     expected = ['tcp://0.0.0.0:3000', 'ssl://192.0.2.100:5000', 'ssl://192.0.2.101:5000?no_tlsv1=true', 'unix:///run/puma.sock', 'tcp://0.0.0.0:5000']
     assert_equal expected, result
+  end
+
+  def test_runs_before_parse_hooks
+    mock = Minitest::Mock.new
+    proc = -> { mock.call }
+
+    @binder.before_parse(&proc)
+
+    mock.expect(:call, nil)
+
+    @binder.parse ["tcp://localhost:0"]
+
+    assert_mock mock
+    assert_equal @binder.instance_variable_get(:@before_parse), [proc]
   end
 
   def test_localhost_addresses_dont_alter_listeners_for_tcp_addresses
@@ -192,7 +208,16 @@ class TestBinderParallel < TestBinderBase
     end
   end
 
-  def test_binder_parses_nil_low_latency
+  def test_binder_tcp_defaults_to_low_latency_off
+    skip_if :jruby
+    @binder.parse ["tcp://0.0.0.0:0"], @log_writer
+
+    socket = @binder.listeners.first.last
+
+    refute socket.getsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY).bool
+  end
+
+  def test_binder_tcp_parses_nil_low_latency
     skip_if :jruby
     @binder.parse ["tcp://0.0.0.0:0?low_latency"], @log_writer
 
@@ -201,7 +226,7 @@ class TestBinderParallel < TestBinderBase
     assert socket.getsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY).bool
   end
 
-  def test_binder_parses_true_low_latency
+  def test_binder_tcp_parses_true_low_latency
     skip_if :jruby
     @binder.parse ["tcp://0.0.0.0:0?low_latency=true"], @log_writer
 
@@ -217,6 +242,26 @@ class TestBinderParallel < TestBinderBase
     socket = @binder.listeners.first.last
 
     refute socket.getsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY).bool
+  end
+
+  def test_binder_ssl_defaults_to_true_low_latency
+    skip_unless :ssl
+    skip_if :jruby
+    @binder.parse ["ssl://0.0.0.0:0?#{ssl_query}"], @log_writer
+
+    socket = @binder.listeners.first.last
+
+    assert socket.to_io.getsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY).bool
+  end
+
+  def test_binder_ssl_parses_false_low_latency
+    skip_unless :ssl
+    skip_if :jruby
+    @binder.parse ["ssl://0.0.0.0:0?#{ssl_query}&low_latency=false"], @log_writer
+
+    socket = @binder.listeners.first.last
+
+    refute socket.to_io.getsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY).bool
   end
 
   def test_binder_parses_tlsv1_disabled
@@ -381,29 +426,27 @@ class TestBinderParallel < TestBinderBase
   end
 
   def test_rack_multithread_default_configuration
-    binder = Puma::Binder.new(@log_writer)
-
-    assert binder.proto_env["rack.multithread"]
+    assert @binder.proto_env["rack.multithread"]
   end
 
   def test_rack_multithread_custom_configuration
     conf = Puma::Configuration.new(max_threads: 1)
+    conf.clamp
 
-    binder = Puma::Binder.new(@log_writer, conf)
+    binder = Puma::Binder.new(@log_writer, conf.options)
 
     refute binder.proto_env["rack.multithread"]
   end
 
   def test_rack_multiprocess_default_configuration
-    binder = Puma::Binder.new(@log_writer)
-
-    refute binder.proto_env["rack.multiprocess"]
+    refute @binder.proto_env["rack.multiprocess"]
   end
 
   def test_rack_multiprocess_custom_configuration
     conf = Puma::Configuration.new(workers: 1)
+    conf.clamp
 
-    binder = Puma::Binder.new(@log_writer, conf)
+    binder = Puma::Binder.new(@log_writer, conf.options)
 
     assert binder.proto_env["rack.multiprocess"]
   end
@@ -510,6 +553,17 @@ class TestBinderMRI < TestBinderBase
     @binder.parse ["ssl://0.0.0.0?#{ssl_query}&ssl_cipher_filter=#{ssl_cipher_filter}"], @log_writer
 
     assert_equal ssl_cipher_filter, ssl_context_for_binder.ssl_cipher_filter
+  end
+
+  def test_binder_parses_ssl_ciphersuites
+    skip_unless :ssl
+    skip('Requires TLSv1.3') unless Puma::MiniSSL::HAS_TLS1_3
+
+    ssl_ciphersuites = "TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256"
+
+    @binder.parse ["ssl://0.0.0.0?#{ssl_query}&ssl_ciphersuites=#{ssl_ciphersuites}"], @log_writer
+
+    assert_equal ssl_ciphersuites, ssl_context_for_binder.ssl_ciphersuites
   end
 
   def test_binder_parses_ssl_verification_flags_one

@@ -2,7 +2,7 @@ require 'puma/detect'
 require 'puma/log_writer'
 require_relative "helper"
 
-class TestLogWriter < Minitest::Test
+class TestLogWriter < PumaTest
   def test_null
     log_writer = Puma::LogWriter.null
 
@@ -142,7 +142,7 @@ class TestLogWriter < Minitest::Test
     assert_match %r!\("GET #{path}" - \(-\)\)!, log_writer.stderr.string
   ensure
     sock.close if sock && !sock.closed?
-    server.stop true
+    server&.stop(true)
   end
 
   # test_puma_server_ssl.rb checks that ssl errors are raised correctly,
@@ -170,10 +170,8 @@ class TestLogWriter < Minitest::Test
     assert_includes error, "peer: 127.0.0.1"
     assert_includes error, "cert: test_cert"
 
-    log_writer.stderr.string = ''
-
     log_writer.ssl_error OpenSSL::SSL::SSLError, ssl_mock.call(nil, nil)
-    error = log_writer.stderr.string
+    error = log_writer.stderr.string.lines[1]
     assert_includes error, "SSL error"
     assert_includes error, "peer: <unknown>"
     assert_includes error, "cert: :"

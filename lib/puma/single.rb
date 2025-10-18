@@ -16,8 +16,8 @@ module Puma
     # @!attribute [r] stats
     def stats
       {
-        started_at: @started_at.utc.iso8601
-      }.merge(@server.stats).merge(super)
+        started_at: utc_iso8601(@started_at)
+      }.merge(@server&.stats || {}).merge(super)
     end
 
     def restart
@@ -53,9 +53,14 @@ module Puma
       server_thread = server.run
 
       log "Use Ctrl-C to stop"
+
+      warn_ruby_mn_threads
+
       redirect_io
 
-      @events.fire_on_booted!
+      @events.fire_after_booted!
+
+      debug_loaded_extensions("Loaded Extensions:") if @log_writer.debug?
 
       begin
         server_thread.join

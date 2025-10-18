@@ -32,10 +32,11 @@ module Puma
             "#{k}: \"#{v}\"\n" : "#{k}: #{v}\n")
         end
       end
+
       if permission
-        File.write path, contents, mode: 'wb:UTF-8'
-      else
         File.write path, contents, mode: 'wb:UTF-8', perm: permission
+      else
+        File.write path, contents, mode: 'wb:UTF-8'
       end
     end
 
@@ -56,11 +57,11 @@ module Puma
     end
 
     ALLOWED_FIELDS.each do |f|
-      define_method f do
+      define_method f.to_sym do
         @options[f]
       end
 
-      define_method "#{f}=" do |v|
+      define_method :"#{f}=" do |v|
         @options[f] = v
       end
     end
